@@ -1,0 +1,177 @@
+Open the Azure Powershell command prompt and type:
+STEP 1:
+Add-WAPackEnvironment -Name MyWAPEnvironment -PublishSettingsFileUrl https://your-azurepack-url/ publishsettings -ServiceEndpoint https://api.your-azure-url
+
+STEP 2:
+Get-WAPackPublishSettingsFile -Environment MyWAPEnvironment
+This command will download the publishsettings file from the AzurePack Environment.(if you have any older subscriptions left in your machine its recommended to clean up the certificates (certmgr.msc) and delete the subscription (Remove-WAPackSubscription))
+This command will open up the portal to download the publishsettings file:
+ 
+
+STEP 3:
+Import-WAPackPublishSettingsFile C:\ -Environment MyWAPEnvironment
+Get-WapackSubscription
+ 
+The subscription details can be rechecked from the portal.
+On WAP Portal Go to My Accounts and check for Management Certificates.
+ 
+Type certmgr and expand the personal option to check the certificate.
+STEP 5:
+Delete the downloaded publish settings file from the folder where it was downloaded.(For the sake of security).
+
+STEP 6:
+This powershell script can be used to access VM Role:
+#region GetWAPConnectionData
+
+# Get WAP Subscription Information
+$WAPSubscription = Get-WAPackSubscription
+
+# Set Subscription
+$SubscriptionID = $WAPSubscription.SubscriptionId
+
+# Get Management Certificate Info
+$CertThumb = $WAPSubscription.Certificate.Thumbprint
+$CertPath = "Cert:\CurrentUser\My\{0}" -f $CertThumb
+$Cert = Get-Item $CertPath
+
+# Set Tenant Portal Address
+$TenantPortalAddress = $WAPSubscription.ServiceEndpoint.Host
+
+# Set Port
+$Port = $WAPSubscription.ServiceEndpoint.Port
+
+#endregion GetWAPConnectionData
+
+#region SetVariables
+
+# Set Gallery Item Name and Version for Match and Deploy
+$GalleryItemName = "DomainController"
+$GIVersion = "1.0.0.0"
+
+# Set Common Gallery Item Parameters
+$UserID = "name@company.com"
+$VMRoleNetwork = "Tenant Network ({0})" -f $UserID
+$CloudServiceName = "CloudService-4-{0}" -f $SubscriptionID
+$VMRoleName = "ActiveDirectory"
+$VMRoleNamePattern = "DC##"
+$VMRoleSize = "ExtraSmall"
+$VMRoleTZ = "Pacific Standard Time"
+$OSDisk = "Windows Server 2012 Datacenter"
+$OSDiskVersion = "1.0.0.0"
+$Password = "password"
+
+#endregion SetVariables
+
+#region GetResDef
+
+# Get Gallery Item Reference
+$GIReferenceUri = "https://{0}:{1}/{2}/Gallery/GalleryItems/$/MicrosoftCompute.VMRoleGalleryItem?api-version=2013-03" -f $TenantPortalAddress,$Port,$SubscriptionID
+$GIReferenceData = [xml](Invoke-WebRequest -Certificate $Cert -Uri $GIReferenceUri | Select-Object -ExpandProperty Content)
+$GalleryItemREF = $GIReferenceData.feed.entry.content.properties.resourcedefinitionUrl | ? {$_ -match $GalleryItemName}
+
+# Get Gallery Item Resource Definition
+$GIResDEFUri = "https://{0}:{1}/{2}/{3}/?api-version=2013-03" -f $TenantPortalAddress,$Port,$SubscriptionID,$GalleryItemREF
+$GIResourceDEFJSON = Invoke-WebRequest -Certificate $Cert -Uri $GIResDEFUri | Select-Object -ExpandProperty Content
+
+#Convert ResDef JSON to Dictionary
+[System.Reflection.Assembly]::LoadWithPartialName("System.Web.Extensions") | Out-Null
+$JSSerializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+$ResDef = $JSSerializer.DeserializeObject($GIResourceDEFJSON)
+
+#endregion GetResDef
+
+#region SetResDefConfig
+
+# Create Gallery Item Parameter Hashtable (for Common Data)
+$GIParamList = @{
+    VMRoleVMSize = $VMRoleSize
+    VMRoleOSVirtualHardDiskImage = "{0}:{1}" -f $OSDisk,$OSDiskVersion
+    VMRoleAdminCredential = "administrator:{0}" -f $Password
+    VMRoleTimeZone = $VMRoleTZ
+    VMRoleComputerNamePattern = $VMRoleNamePattern
+    VMRoleNetworkRef = $VMRoleNetwork
+    }
+
+# Add to Gallery Item Parameter Hashtable (for GI Specific Data)
+if ($GalleryItemName -eq "DomainController")
+{
+    $GIParamList += @{DomainControllerWindows2012DomainDNSName = $UserID.Split("@")[1]} 
+    $GIParamList += @{DomainControllerWindows2012DomainNETBIOSName = ($UserID.Split("@")[1]).Split(".")[0]}
+    $GIParamList += @{DomainControllerWindows2012SafeModeAdminPassword = $Password}
+}
+   
+# Convert Gallery Item Parameter Hashtable To JSON
+$ResDefConfigJSON = ConvertTo-Json $GIParamList
+
+#Add ResDefConfig JSON to Dictionary
+$ResDefConfig = New-Object 'System.Collections.Generic.Dictionary[String,Object]'
+$ResDefConfig.Add("Version",$GIVersion)
+$ResDefConfig.Add("ParameterValues",$ResDefConfigJSON)
+
+#endregion SetResDefConfig
+
+#region GenerateGIPayloadJSON
+
+# Set Gallery Item Payload Variables
+$GISubstate = $null
+$GILabel = $VMRoleName
+$GIName = $VMRoleName
+$GIProvisioningState = $null
+$GIInstanceView = $null
+
+# Set Gallery Item Payload Info
+$GIPayload = @{
+    "InstanceView" = $GIInstanceView
+    "Substate" = $GISubstate
+    "Name" = $GIName
+    "Label" = $GILabel
+    "ProvisioningState" = $GIProvisioningState
+    "ResourceConfiguration" = $ResDefConfig
+    "ResourceDefinition" = $ResDef
+    }
+
+# Convert Gallery Item Payload Info To JSON
+$GIPayloadJSON = ConvertTo-Json $GIPayload -Depth 7
+
+#endregion GenerateGIPayloadJSON
+
+#region GetOrSetCloudService
+
+# Get Cloud Services
+$CloudServicesUri = "https://{0}:{1}/{2}/CloudServices?api-version=2013-03" -f $TenantPortalAddress,$Port,$SubscriptionID
+$CloudServicesData = [xml](Invoke-WebRequest -Uri $CloudServicesUri -Certificate $Cert | Select-Object -ExpandProperty Content)
+$CloudService = $CloudServicesData.feed.entry.content.properties.Name | ? {$_ -match $CloudServiceName}
+if (!$CloudService) {
+    # Set Cloud Service Configuration
+    $CloudServiceConfig = @{
+        "Name" = $CloudServiceName
+        "Label" = $CloudServiceName
+        }
+
+    # Convert Cloud Service Configuration To JSON
+    $CloudServiceConfigJSON = ConvertTo-Json $CloudServiceConfig
+
+    $CloudServicesData = [xml](Invoke-WebRequest -Uri $CloudServicesUri -Certificate $Cert -Method Post -Body $CloudServiceConfigJSON -ContentType "application/json")
+    $CloudService = $CloudServicesData.entry.content.properties.Name | ? {$_ -match $CloudServiceName}
+}
+
+#endregion GetOrSetCloudService
+
+#region DeployGIVMRole
+
+# Set Gallery Item VM Role Deploy URI
+$GIDeployUri = "https://{0}:{1}/{2}/CloudServices/{3}/Resources/MicrosoftCompute/VMRoles/?api-version=2013-03" -f $TenantPortalAddress,$Port,$SubscriptionID,$CloudService
+
+# Deploy Gallery Item VM Role
+$VMRoleDeployed = Invoke-WebRequest -Uri $GIDeployUri -Certificate $Cert -Method Post -Body $GIPayloadJSON -ContentType "application/json"
+$VMRoleDeployed
+
+#endregion DeployGIVMRole 
+
+Trouble Shooting:
+1. Check if any other certificate is there using certmgr command. 
+2.Check for the path of the PublishSettings file before importing.
+3. Check the VM's with WAPack using Get-WAPackvm command.
+4. Check the Environment for importing using Get-WAPackEnvironment
+
+
